@@ -388,13 +388,13 @@ static void reset_game(void) {
 	for (int i = 1; i <= NUM_OBST; i++) {
 		/* spawn far ahead so the player has time to react */
 		spheres[i].center = v3(frand(-220000, 220000),
-				       32768, -(983040 + i * 786432));
+				       32768, -(1600000 + i * 900000 + frand(0, 600000)));
 		spheres[i].radius = 65536 * 50 / 100;
 	}
 }
 
 static void update_game(u16 buttons) {
-	fx accel = FX_ONE / 14;
+	fx accel = FX_ONE / 10;
 
 	if (game_state == GS_TITLE) {
 		if (!(buttons & 0x0008)) { /* start */
@@ -419,23 +419,23 @@ static void update_game(u16 buttons) {
 	if (!(buttons & 0x0020))
 		player_vx += accel;
 	player_vx = fmul(player_vx, 65536 - 2000); /* friction */
-	if (player_vx > 65536 / 8)
-		player_vx = 65536 / 8;
-	if (player_vx < -65536 / 8)
-		player_vx = -65536 / 8;
+	if (player_vx > 65536 / 5)
+		player_vx = 65536 / 5;
+	if (player_vx < -65536 / 5)
+		player_vx = -65536 / 5;
 
 	player_x += player_vx;
-	if (player_x > 200000)
-		player_x = 200000;
-	if (player_x < -200000)
-		player_x = -200000;
+	if (player_x > 163840)
+		player_x = 163840;
+	if (player_x < -163840)
+		player_x = -163840;
 
 	score_frames++;
 
 	/* difficulty ramps */
-	world_speed = 100000 + score_frames * 40;
-	if (world_speed > 260000)
-		world_speed = 260000;
+	world_speed = 35000 + score_frames * 15;
+	if (world_speed > 80000)
+		world_speed = 80000;
 
 	/* obstacles scroll toward +z; recycle when passed */
 	for (int i = 1; i <= NUM_OBST; i++) {
@@ -762,7 +762,7 @@ static void render_frame(void) {
 }
 
 static void update_camera(void) {
-	fx cx = player_x >> 1; /* camera follows half of player x */
+	fx cx = player_x; /* camera follows the player exactly */
 	cam_pos = v3(cx, 144179, 294912);
 	vec3 target = v3(cx, 48000, -160000);
 	cam_fwd   = vnorm(vsub(target, cam_pos));

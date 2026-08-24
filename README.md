@@ -7,11 +7,17 @@ PlayStation emulator written completely from scratch to run it.
 
 ## Layout
 
-- `demo/`        — the ray tracing demo (PSn00bSDK homebrew, builds `psxrt.exe`)
+- `demo/`        — the ray tracing demo with a free-fly camera (builds `psxrt.exe`)
 - `game/`        — **REFLECTOR**, a complete ray-traced 3D dodge game (`game.exe`)
 - `emulator/`    — "oxpsx", a from-scratch PS1 emulator (C + SDL2)
 - `cputest/`     — CPU instruction test suite (validates the emulator)
 - `toolchain/`   — prebuilt mipsel-none-elf GCC 12.3 + PSn00bSDK 0.24
+
+## The demo controls
+
+The demo has a free-fly camera: **LEFT/RIGHT** turn, **UP/DOWN** fly
+forward/back at walking height. Fly around the mirror sphere and the
+orbiting spheres and watch the reflections update.
 
 ## The game (game/main.c)
 

@@ -27,6 +27,7 @@ static void VSync(int m) { (void)m; }
 static void LoadImage(RECT *r, uint32_t *d) { (void)r; (void)d; }
 #else
 #include <psxgpu.h>
+#include <psxapi.h>
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -50,6 +51,8 @@ static void LoadImage(RECT *r, uint32_t *d) { (void)r; (void)d; }
 /* Fixed point math (Q16.16)                                           */
 /* ------------------------------------------------------------------ */
 
+typedef uint16_t u16;
+typedef uint8_t u8;
 typedef int32_t fx;
 #define FX_ONE 0x00010000
 
@@ -208,6 +211,98 @@ static inline uint16_t pack555(fx r, fx g, fx b) {
 	/* PS1 VRAM is BGR555: R in bits 0-4, G in 5-9, B in 10-14 */
 	return (uint16_t)((r >> 11) | ((g >> 6) & 0x03E0) | ((b >> 1) & 0x7C00));
 }
+
+/* ------------------------------------------------------------------ */
+/* Tiny 5x7 font for HUD text                                          */
+/* ------------------------------------------------------------------ */
+
+static const uint8_t font[][8] = {
+	{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
+	{0x0E,0x11,0x13,0x15,0x19,0x11,0x0E,0x00}, /* 0 */
+	{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E,0x00}, /* 1 */
+	{0x0E,0x11,0x01,0x02,0x04,0x08,0x1F,0x00}, /* 2 */
+	{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E,0x00}, /* 3 */
+	{0x02,0x06,0x0A,0x12,0x1F,0x02,0x02,0x00}, /* 4 */
+	{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E,0x00}, /* 5 */
+	{0x06,0x08,0x10,0x1E,0x11,0x11,0x0E,0x00}, /* 6 */
+	{0x1F,0x01,0x02,0x04,0x08,0x08,0x08,0x00}, /* 7 */
+	{0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E,0x00}, /* 8 */
+	{0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C,0x00}, /* 9 */
+	{0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00,0x00}, /* : */
+	{0x00,0x00,0x00,0x1F,0x00,0x00,0x00,0x00}, /* - */
+	{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E,0x00}, /* C 13 */
+	{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E,0x00}, /* D 14 */
+	{0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F,0x00}, /* E 15 */
+	{0x1F,0x10,0x10,0x1E,0x10,0x10,0x10,0x00}, /* F 16 */
+	{0x11,0x11,0x11,0x1F,0x11,0x11,0x11,0x00}, /* H 17 */
+	{0x06,0x09,0x08,0x08,0x08,0x09,0x06,0x00}, /* I 18 (dot+stem) */
+	{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E,0x00}, /* O 19 (dup) */
+	{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10,0x00}, /* P 20 */
+	{0x11,0x1B,0x15,0x15,0x11,0x11,0x11,0x00}, /* M 21 */
+	{0x11,0x11,0x11,0x15,0x15,0x1B,0x11,0x00}, /* W 22 */
+	{0x11,0x11,0x0A,0x04,0x04,0x04,0x04,0x00}, /* Y 23 */
+	{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F,0x00}, /* Z 24 */
+	{0x0E,0x11,0x10,0x17,0x11,0x11,0x0F,0x00}, /* G */
+	{0x10,0x10,0x10,0x10,0x10,0x10,0x1F,0x00}, /* L */
+	{0x0E,0x11,0x11,0x11,0x11,0x11,0x0E,0x00}, /* O */
+	{0x1E,0x11,0x11,0x1E,0x14,0x12,0x11,0x00}, /* R */
+	{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E,0x00}, /* S */
+	{0x1F,0x04,0x04,0x04,0x04,0x04,0x04,0x00}, /* T */
+	{0x11,0x11,0x11,0x11,0x11,0x11,0x0E,0x00}, /* U */
+	{0x11,0x0A,0x04,0x04,0x04,0x0A,0x11,0x00}, /* X */
+	{0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x00}, /* M (unused spare) */
+	{0x08,0x49,0x4A,0x2C,0x08,0x08,0x08,0x00}, /* arrow-up-ish */
+};
+
+static int font_idx(char c) {
+	if (c >= '0' && c <= '9')
+		return 1 + (c - '0');
+	if (c == ':') return 11;
+	if (c == '-') return 12;
+	switch (c) {
+	case 'C': return 13;
+	case 'D': return 14;
+	case 'E': return 15;
+	case 'F': return 16;
+	case 'H': return 17;
+	case 'I': return 18;
+	case 'O': return 19;
+	case 'P': return 20;
+	case 'M': return 21; /* doubles as N */
+	case 'W': return 22;
+	case 'Y': return 23;
+	case 'Z': return 24;
+	case 'G': return 25;
+	case 'L': return 26;
+	case 'R': return 28;
+	case 'S': return 29;
+	case 'T': return 30;
+	case 'U': return 31;
+	case 'X': return 32;
+	}
+	return 0;
+}
+
+static void draw_text(int x, int y, const char *s, uint16_t col) {
+	while (*s) {
+		const uint8_t *g = font[font_idx(*s)];
+		for (int row = 0; row < 7; row++) {
+			uint8_t bits = g[row];
+			if (!bits || y + row >= RT_H)
+				continue;
+			uint16_t *line = &fb[y + row][x];
+			for (int c = 0; c < 5; c++)
+				if (bits & (0x10 >> c)) {
+					if (x + c >= 0 && x + c < RT_W)
+						line[c] = col;
+				}
+		}
+		x += 6;
+		s++;
+	}
+}
+
+static volatile u16 pad_buf1[8];
 
 /* ------------------------------------------------------------------ */
 /* Ray tracing                                                         */
@@ -446,18 +541,40 @@ int main(int argc, const char **argv) {
 	spheres[2].ar = 8192;  spheres[2].ag = 20480; spheres[2].ab = 57344;
 	spheres[2].reflect = 0;
 
+	InitPAD((u8 *)pad_buf1, 8, (u8 *)pad_buf1, 8);
+	StartPAD();
+
+	/* free-fly camera: starts 4.5 units from the mirror sphere, facing it */
+	int yaw = 0; /* 1/1024 turn; fwd = (sin,0,-cos) */
+	cam_pos = v3(0, 78643, 425984); /* (0, 1.2, 6.5) */
+
 	uint32_t frame_counter = 0;
 
 	for (;;) {
 		int ang = frame_counter * 2;
+		u16 buttons = pad_buf1[1];
 
-		/* orbiting camera, radius 4.5, height 2.2, looking near origin */
-		cam_pos = v3(fmul(fsin(ang), 294912), 144179, fmul(fcos(ang), 294912));
-		vec3 target = v3(0, 65536, 0);
-		cam_fwd   = vnorm(vsub(target, cam_pos));
-		vec3 w_up = v3(0, FX_ONE, 0);
-		cam_right = vnorm(vcross(cam_fwd, w_up));
-		cam_up    = vnorm(vcross(cam_right, cam_fwd));
+		/* free camera: LEFT/RIGHT turn, UP/DOWN fly fwd/back */
+		if (!(buttons & 0x0080))
+			yaw -= 10;
+		if (!(buttons & 0x0020))
+			yaw += 10;
+		fx mf = fmul(fsin(yaw), 8000);   /* move speed, fx units/frame */
+		if (!(buttons & 0x0010)) {
+			cam_pos.x += fmul(fsin(yaw), 8000);
+			cam_pos.z -= fmul(fcos(yaw), 8000);
+		}
+		if (!(buttons & 0x0040)) {
+			cam_pos.x -= fmul(fsin(yaw), 8000);
+			cam_pos.z += fmul(fcos(yaw), 8000);
+		}
+		(void)mf;
+		cam_pos.y = 65536; /* walking height */
+
+		/* camera basis from yaw */
+		cam_fwd   = v3(fsin(yaw), 0, -fcos(yaw));
+		cam_right = v3(fcos(yaw), 0, fsin(yaw));
+		cam_up    = v3(0, FX_ONE, 0);
 
 		/* animate spheres (world units in fx) */
 		spheres[0].center = v3(0, 65536 + fmul(fsin(frame_counter * 3), 8192), 0);
@@ -468,7 +585,9 @@ int main(int argc, const char **argv) {
 		spheres[2].radius = 23000;
 
 		render_frame();
-		draw_int(2, 2, frame_counter, 6);
+		draw_text(2, 2, "REFLECTOR", 0x03FF);
+		draw_text(2, 12, "UP/DOWN FLY  LEFT/RIGHT TURN", 0xFFFF);
+		draw_int(2, RT_H - 10, frame_counter, 6);
 
 		DrawSync(0);
 		VSync(0);
