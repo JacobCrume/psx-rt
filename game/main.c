@@ -258,172 +258,102 @@ static void draw_int(int x, int y, int32_t val, int digits) {
 /* Ray tracing                                                         */
 /* ------------------------------------------------------------------ */
 
-static inline int trace_spheres(vec3 ro, vec3 rd, fx tmax, fx *t_out, vec3 *n_out,
-				int skip) {
-	int hit = -1;
-	fx t_best = tmax;
+/*
+ * Incremental analytic renderer.
+ *
+ * Rays are rd = fwd + u*right + v*up with an orthonormal camera basis, so
+ * |rd|^2 = 1 + u^2 + v^2, stepped across the screen with pure adds (second
+ * differences). Sphere intersections use e = normalize(center - cam),
+ * b = e*rd (linear in u,v - one add per pixel per sphere) and the quadratic
+ * b^2 - A*cc. Per-sphere screen bounding boxes reject most spheres with two
+ * compares. The camera never rolls, so right.y == 0: the ground-plane hit t
+ * is constant per row and ground points step linearly per pixel, so the
+ * checkerboard costs only shifts. Sun shadows on the ground are solved as
+ * one quadratic per obstacle per row (a pixel interval), replacing
+ * per-pixel shadow rays.
+ */
+
+#define FOCAL 27525
+#define ROW_DU 491                       /* (2*FOCAL)/RT_W */
+#define ROW_DV 655                       /* (2*FOCAL)/RT_H */
+#define ROW_U0 (-(ROW_DU * (RT_W - 1)) / 2)
+#define ROW_V0 ((ROW_DV * (RT_H - 1)) / 2)  /* top of screen looks up */
+
+static inline fx fdiv(fx a, fx b) {
+	return (fx)(((int64_t)a << 16) / b);
+}
+
+static inline uint16_t pack555(fx r, fx g, fx b) {
+	if (r < 0) r = 0; else if (r > 65535) r = 65535;
+	if (g < 0) g = 0; else if (g > 65535) g = 65535;
+	if (b < 0) b = 0; else if (b > 65535) b = 65535;
+	return (uint16_t)((r >> 11) | ((g >> 6) & 0x03E0) | ((b >> 1) & 0x7C00));
+}
+
+static vec3 sph_oc[NUM_SPHERES];  /* center - cam */
+static fx   sph_cc[NUM_SPHERES];  /* dist^2 - r^2 (fx^2) */
+static fx   sph_b0[NUM_SPHERES];  /* e*fwd */
+static fx   sph_bu[NUM_SPHERES];  /* e*right (per-pixel step) */
+static fx   sph_bv[NUM_SPHERES];  /* e*up */
+static fx   sph_umin[NUM_SPHERES], sph_umax[NUM_SPHERES];
+static int  sph_py0[NUM_SPHERES], sph_py1[NUM_SPHERES];
+
+static fx Lhx, Lhz, Ly2;          /* sun horizontal unit dir, Ly^2 */
+static fx lit_plane;              /* precomputed plane lambert */
+static fx chk_r, chk_g, chk_b;    /* light checker * lit */
+static fx chk_dr, chk_dg, chk_db; /* dark checker * lit */
+static fx shd_r, shd_g, shd_b;    /* blocked checker * AMBIENT */
+static fx shd_dr, shd_dg, shd_db;
+
+static void rt_init(void) {
+	fx lh = fsqrt(fmul(light_dir.x, light_dir.x) +
+		      fmul(light_dir.z, light_dir.z));
+	Lhx = fdiv(light_dir.x, lh);
+	Lhz = fdiv(light_dir.z, lh);
+	Ly2 = fmul(light_dir.y, light_dir.y);
+	lit_plane = AMBIENT + fmul(light_dir.y, FX_ONE - AMBIENT);
+
+	chk_r = fmul(45000, lit_plane); chk_g = fmul(45000, lit_plane);
+	chk_b = fmul(45000, lit_plane);
+	chk_dr = fmul(11500, lit_plane); chk_dg = fmul(13500, lit_plane);
+	chk_db = fmul(15000, lit_plane);
+	shd_r = fmul(45000, AMBIENT); shd_g = fmul(45000, AMBIENT);
+	shd_b = fmul(45000, AMBIENT);
+	shd_dr = fmul(11500, AMBIENT); shd_dg = fmul(13500, AMBIENT);
+	shd_db = fmul(15000, AMBIENT);
+}
+
+static void rt_setup(void) {
 	for (int i = 0; i < NUM_SPHERES; i++) {
-		if (i == skip)
+		vec3 oc = vsub(spheres[i].center, cam_pos);
+		fx dist2 = vdot(oc, oc);
+		sph_oc[i] = oc;
+		sph_b0[i] = vdot(oc, cam_fwd);
+		sph_bu[i] = fmul(vdot(oc, cam_right), ROW_DU);
+		sph_bv[i] = vdot(oc, cam_up);
+		sph_cc[i] = dist2 - fmul(spheres[i].radius, spheres[i].radius);
+
+		if (sph_b0[i] <= 0 || sph_cc[i] < 0) {
+			sph_py0[i] = 1; sph_py1[i] = 0; /* empty */
+			sph_umin[i] = 0; sph_umax[i] = -1;
 			continue;
-		vec3 oc = vsub(ro, spheres[i].center);
-		fx b    = vdot(oc, rd);
-		fx c    = vdot(oc, oc) - fmul(spheres[i].radius, spheres[i].radius);
-		fx disc = fmul(b, b) - c;
-		if (disc < 0)
-			continue;
-		fx sq = fsqrt(disc);
-		fx t  = -b - sq;
-		if (t < 0)
-			t = -b + sq;
-		if (t < 0 || t >= t_best)
-			continue;
-		t_best = t;
-		hit    = i;
-	}
-	if (hit >= 0) {
-		vec3 p = vadd(ro, vscale(rd, t_best));
-		*n_out = vnorm(vsub(p, spheres[hit].center));
-		*t_out = t_best;
-	}
-	return hit;
-}
-
-static inline vec3 sky_color(vec3 rd) {
-	fx h = rd.y;
-	if (h < 0)
-		h = 0;
-	fx q = h >> 1;
-	return v3(SKY_R - q, SKY_G - (h >> 2), SKY_B);
-}
-
-/* returns 1 if plane hit */
-static inline int shade_plane(vec3 ro, vec3 rd, fx tmax, fx *pr, fx *pg, fx *pb) {
-	if (rd.y >= 0)
-		return 0;
-	fx t = fmul(PLANE_Y - ro.y, finv(-rd.y));
-	if (t < 0 || t >= tmax)
-		return 0;
-
-	vec3 p = vadd(ro, vscale(rd, t));
-	int ix = p.x >> 16;
-	int iz = p.z >> 16;
-	int checker = (ix ^ iz) & 1;
-
-	/* sun shadow ray */
-	vec3 n = v3(0, FX_ONE, 0);
-	vec3 org = vadd(p, vscale(n, 4096));
-	fx   ts;
-	vec3 ns;
-	int blocked = trace_spheres(org, light_dir, TMAX, &ts, &ns, -1) >= 0;
-
-	fx base = checker ? 45000 : 11500;
-	fx gcol = checker ? 45000 : 13500;
-	fx bcol = checker ? 45000 : 15000;
-
-	fx lit = blocked ? AMBIENT : (AMBIENT + fmul(-light_dir.y, FX_ONE - AMBIENT));
-
-	fx fog = fmul(t, FOG_INV_RANGE);
-	if (fog > FX_ONE)
-		fog = FX_ONE;
-	fx keep = FX_ONE - fog;
-
-	*pr = fmul(fmul(base, lit), keep) + fmul(SKY_R, fog);
-	*pg = fmul(fmul(gcol, lit), keep) + fmul(SKY_G, fog);
-	*pb = fmul(fmul(bcol, lit), keep) + fmul(SKY_B, fog);
-	return 1;
-}
-
-static uint16_t trace_pixel(vec3 ro, vec3 rd) {
-	fx   t;
-	vec3 n;
-	int  hit = trace_spheres(ro, rd, TMAX, &t, &n, -1);
-
-	fx cr, cg, cb;
-
-	if (hit >= 0) {
-		Sphere *s = &spheres[hit];
-		vec3 p = vadd(ro, vscale(rd, t));
-
-		fx ndl = vdot(n, light_dir);
-		if (ndl < 0)
-			ndl = 0;
-
-		vec3 sorg = vadd(p, vscale(n, 4096));
-		fx   t_sh;
-		vec3 n_sh;
-		int blocked = trace_spheres(sorg, light_dir, TMAX, &t_sh, &n_sh, hit) >= 0;
-
-		fx lit;
-		if (blocked)
-			lit = AMBIENT;
-		else
-			lit = AMBIENT + fmul(ndl, FX_ONE - AMBIENT);
-
-		cr = fmul(s->ar, lit);
-		cg = fmul(s->ag, lit);
-		cb = fmul(s->ab, lit);
-
-		if (s->reflect > 0) {
-			/* mirror: one reflective bounce */
-			fx   dn  = vdot(rd, n) * 2;
-			vec3 rfl = vsub(rd, vscale(n, dn));
-			vec3 org = vadd(p, vscale(rfl, 1024));
-
-			fx   t2;
-			vec3 n2;
-			fx rr, rg, rb;
-			int h2 = trace_spheres(org, rfl, TMAX, &t2, &n2, hit);
-			if (h2 >= 0) {
-				Sphere *s2 = &spheres[h2];
-				fx ndl2 = vdot(n2, light_dir);
-				if (ndl2 < 0)
-					ndl2 = 0;
-				vec3 o2 = vadd(vadd(org, vscale(rfl, t2)),
-					       vscale(n2, 4096));
-				fx   t3;
-				vec3 n3;
-				int blk = trace_spheres(o2, light_dir, TMAX, &t3, &n3, h2) >= 0;
-				fx l2 = blk ? AMBIENT
-					    : (AMBIENT + fmul(ndl2, FX_ONE - AMBIENT));
-				rr = fmul(s2->ar, l2);
-				rg = fmul(s2->ag, l2);
-				rb = fmul(s2->ab, l2);
-			} else if (!shade_plane(org, rfl, TMAX, &rr, &rg, &rb)) {
-				vec3 sk = sky_color(rfl);
-				rr = sk.x;
-				rg = sk.y;
-				rb = sk.z;
-			}
-
-			cr = fmul(cr, FX_ONE - s->reflect) + fmul(rr, s->reflect);
-			cg = fmul(cg, FX_ONE - s->reflect) + fmul(rg, s->reflect);
-			cb = fmul(cb, FX_ONE - s->reflect) + fmul(rb, s->reflect);
 		}
-	} else if (!shade_plane(ro, rd, TMAX, &cr, &cg, &cb)) {
-		vec3 sk = sky_color(rd);
-		cr = sk.x;
-		cg = sk.y;
-		cb = sk.z;
+		fx uc = fdiv(sph_bu[i], sph_b0[i]);
+		fx vc = fdiv(sph_bv[i], sph_b0[i]);
+		/* tan(ang radius) = r/sqrt(cc); screen u = tan*focal.
+		 * isqrt(cc<<16) = sqrt(cc_true)*256, hence the >>8. */
+		fx ur = fdiv(fmul(spheres[i].radius, FOCAL),
+			     isqrt32((uint32_t)sph_cc[i]) << 8) << 8 >> 8;
+		ur = fmul(ur, 83558); /* 1.275 margin */
+		sph_umin[i] = uc - ur;
+		sph_umax[i] = uc + ur;
+		sph_py0[i] = (ROW_V0 - vc - ur) / ROW_DV;
+		sph_py1[i] = (ROW_V0 - vc + ur) / ROW_DV;
+		if (sph_py0[i] < 0) sph_py0[i] = 0;
+		if (sph_py1[i] >= RT_H) sph_py1[i] = RT_H - 1;
 	}
-
-	/* distance fog for sphere hits */
-	if (hit >= 0) {
-		fx fog = fmul(t, FOG_INV_RANGE);
-		if (fog > FX_ONE)
-			fog = FX_ONE;
-		fx keep = FX_ONE - fog;
-		cr = fmul(cr, keep) + fmul(SKY_R, fog);
-		cg = fmul(cg, keep) + fmul(SKY_G, fog);
-		cb = fmul(cb, keep) + fmul(SKY_B, fog);
-	}
-
-	if (cr > 65535) cr = 65535;
-	if (cg > 65535) cg = 65535;
-	if (cb > 65535) cb = 65535;
-	return (uint16_t)((cr >> 11) | ((cg >> 6) & 0x03E0) | ((cb >> 1) & 0x7C00));
 }
 
-/* ------------------------------------------------------------------ */
 /* Game state                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -538,20 +468,296 @@ static void update_game(u16 buttons) {
 /* ------------------------------------------------------------------ */
 
 static void render_frame(void) {
-	const fx focal = 27525;
-	const fx du = (fx)(((int64_t)focal * 2) / RT_W);
-	const fx dv = (fx)(((int64_t)focal * 2) / RT_H);
-	fx v = -(fx)(((int64_t)dv * (RT_H - 1)) >> 1);
+	rt_setup();
 
-	for (int py = 0; py < RT_H; py++, v += dv) {
-		fx u = -(fx)(((int64_t)du * (RT_W - 1)) >> 1);
-		for (int px = 0; px < RT_W; px++, u += du) {
-			vec3 rd = vnorm(v3(
-				cam_fwd.x + fmul(cam_right.x, u) + fmul(cam_up.x, v),
-				cam_fwd.y + fmul(cam_right.y, u) + fmul(cam_up.y, v),
-				cam_fwd.z + fmul(cam_right.z, u) + fmul(cam_up.z, v)));
-			fb[py][px] = trace_pixel(cam_pos, rd);
+	fx v = ROW_V0;
+	fx v2 = v * v;                     /* raw fx^4/65536 */
+	fx vstep = -2 * v * ROW_DV + ROW_DV * ROW_DV;  /* raw fx^2 units */
+	const fx vstep2 = 2 * ROW_DV * ROW_DV;
+
+	const fx u0 = ROW_U0;
+	const fx u0_2 = u0 * u0;           /* raw */
+	fx ustep = 2 * u0 * ROW_DU + ROW_DU * ROW_DU;   /* raw fx^2 units */
+	const fx ustep2 = 2 * ROW_DU * ROW_DU;
+
+	for (int py = 0; py < RT_H; py++) {
+		fx A_row = FX_ONE + (v2 >> 16);
+
+		/* per-sphere row setup */
+		fx B[NUM_SPHERES];
+		int rowact[NUM_SPHERES];
+		for (int i = 0; i < NUM_SPHERES; i++) {
+			rowact[i] = (py >= sph_py0[i] && py <= sph_py1[i]);
+			B[i] = rowact[i] ? (sph_b0[i] + fmul(v, sph_bv[i])) : 0;
 		}
+
+		/* ground row: rdy = fwd.y (right.y == 0, roll-free camera) */
+		fx rdy_row = cam_fwd.y + fmul(v, cam_up.y);
+		int ground = rdy_row < 0;
+		fx t_plane = 0, gx = 0, gz = 0, gxs = 0, gzs = 0;
+		fx fog = 0, keep = FX_ONE;
+		fx fr_r = 0, fr_g = 0, fr_b = 0;      /* fogged checker light */
+		fx fd_r = 0, fd_g = 0, fd_b = 0;      /* fogged checker dark */
+		fx sr_r = 0, sr_g = 0, sr_b = 0;      /* fogged shadow light */
+		fx sd_r = 0, sd_g = 0, sd_b = 0;      /* fogged shadow dark */
+		if (ground) {
+			t_plane = fmul(cam_pos.y, finv(-rdy_row));
+			gx = cam_pos.x + fmul(t_plane, cam_fwd.x);
+			gz = cam_pos.z + fmul(t_plane, cam_fwd.z);
+			gxs = fmul(t_plane, cam_right.x);
+			gzs = fmul(t_plane, cam_right.z);
+			fog = fmul(t_plane, FOG_INV_RANGE);
+			if (fog > FX_ONE)
+				fog = FX_ONE;
+			keep = FX_ONE - fog;
+			fr_r = fmul(chk_r, keep) + fmul(SKY_R, fog);
+			fr_g = fmul(chk_g, keep) + fmul(SKY_G, fog);
+			fr_b = fmul(chk_b, keep) + fmul(SKY_B, fog);
+			fd_r = fmul(chk_dr, keep) + fmul(SKY_R, fog);
+			fd_g = fmul(chk_dg, keep) + fmul(SKY_G, fog);
+			fd_b = fmul(chk_db, keep) + fmul(SKY_B, fog);
+			sr_r = fmul(shd_r, keep) + fmul(SKY_R, fog);
+			sr_g = fmul(shd_g, keep) + fmul(SKY_G, fog);
+			sr_b = fmul(shd_b, keep) + fmul(SKY_B, fog);
+			sd_r = fmul(shd_dr, keep) + fmul(SKY_R, fog);
+			sd_g = fmul(shd_dg, keep) + fmul(SKY_G, fog);
+			sd_b = fmul(shd_db, keep) + fmul(SKY_B, fog);
+		}
+
+		/* sky gradient for this row */
+		fx hrow = fmul(rdy_row, finv(fsqrt(A_row)));
+		if (hrow < 0)
+			hrow = 0;
+		fx sq_ = hrow >> 1;
+		fx sky_r = SKY_R - sq_, sky_g = SKY_G - (hrow >> 2), sky_b = SKY_B;
+		if (sky_r < 0) sky_r = 0;
+		if (sky_g < 0) sky_g = 0;
+		uint16_t sky_col = pack555(sky_r, sky_g, sky_b);
+
+		/* shadow intervals on this ground row (per obstacle) */
+		int sh_on[NUM_OBST];
+		int sh_lo[NUM_OBST], sh_hi[NUM_OBST];
+		if (ground) {
+			for (int i = 1; i <= NUM_OBST; i++) {
+				fx dx = gx - (spheres[i].center.x -
+					      fmul(spheres[i].center.y, Lhx));
+				fx dz = gz - (spheres[i].center.z -
+					      fmul(spheres[i].center.y, Lhz));
+				fx B1 = fmul(dx, Lhx) + fmul(dz, Lhz);
+				fx B2 = fmul(dx, Lhz) - fmul(dz, Lhx);
+				fx A1 = fmul(gxs, Lhx) + fmul(gzs, Lhz);
+				fx A2 = fmul(gxs, Lhz) - fmul(gzs, Lhx);
+				fx alpha = fmul(Ly2, fmul(A1, A1)) + fmul(A2, A2);
+				fx beta = fmul(Ly2, fmul(B1, A1)) + fmul(B2, A2);
+				fx gam = fmul(Ly2, fmul(B1, B1)) + fmul(B2, B2)
+					 - fmul(spheres[i].radius, spheres[i].radius);
+				if (alpha == 0) { sh_on[i-1] = 0; continue; }
+				fx q = fdiv(beta, alpha);
+				fx c_raw = fdiv(gam, alpha);
+				fx disc_s = fmul(q, q) - 4 * c_raw;
+				if (disc_s < 0) { sh_on[i-1] = 0; continue; }
+				fx sqs = (fx)isqrt32((uint32_t)disc_s) << 8;
+				fx lo = (q - sqs) >> 1;  /* fx pixel units */
+				fx hi = (q + sqs) >> 1;
+				sh_lo[i-1] = lo >> 16;   /* pixel columns */
+				sh_hi[i-1] = hi >> 16;
+				sh_on[i-1] = 1;
+				if (sh_hi[i-1] < 0 || sh_lo[i-1] >= RT_W)
+					sh_on[i-1] = 0;
+				if (sh_lo[i-1] < 0) sh_lo[i-1] = 0;
+				if (sh_hi[i-1] >= RT_W) sh_hi[i-1] = RT_W - 1;
+			}
+		} else {
+			for (int i = 0; i < NUM_OBST; i++)
+				sh_on[i] = 0;
+		}
+
+		fx u = ROW_U0;
+		fx u2 = u0_2;
+		const fx ustep0 = 2 * u0 * ROW_DU + ROW_DU * ROW_DU;
+		fx ustep = ustep0;
+
+		for (int px = 0; px < RT_W; px++) {
+			fx A = A_row + (u2 >> 16);
+			u2 += ustep;
+			ustep += ustep2;
+
+			fx   tbest = TMAX;
+			int  hit = -1;
+
+			for (int i = 0; i < NUM_SPHERES; i++) {
+				fx b = B[i];
+				B[i] = b + sph_bu[i];
+				if (!rowact[i])
+					continue;
+				if (u < sph_umin[i] || u > sph_umax[i])
+					continue;
+				/* divide the quadratic by A to stay in range:
+				 * t^2 - 2*(b/A)*t + cc/A = 0 */
+				fx disc = fmul(b, b) - fmul(A, sph_cc[i]);
+				if (disc < 0)
+					continue;
+				fx t = fdiv(b - (fx)(isqrt32((uint32_t)disc) << 8), A);
+				if (t < 0 || t >= tbest)
+					continue;
+				tbest = t;
+				hit = i;
+			}
+
+			if (ground && t_plane < tbest) {
+				tbest = t_plane;
+				hit = -2; /* plane */
+			}
+
+			uint16_t out;
+
+			if (hit == -2) {
+				/* ground: checker + sun shadow intervals + fog */
+				int checker = ((gx >> 16) ^ (gz >> 16)) & 1;
+				int blocked = 0;
+				for (int i = 0; i < NUM_OBST; i++) {
+					if (sh_on[i] && px >= sh_lo[i] && px <= sh_hi[i]) {
+						blocked = 1;
+						break;
+					}
+				}
+				out = blocked ? pack555(sr_r, sr_g, sr_b)
+					      : pack555(fr_r, fr_g, fr_b);
+			} else if (hit >= 0) {
+				/* sphere hit: shade with fog */
+				Sphere *sp = &spheres[hit];
+				vec3 rd = v3(cam_fwd.x + fmul(cam_right.x, u) + fmul(cam_up.x, v),
+					     cam_fwd.y + fmul(cam_right.y, u) + fmul(cam_up.y, v),
+					     cam_fwd.z + fmul(cam_right.z, u) + fmul(cam_up.z, v));
+				vec3 p = vadd(cam_pos, vscale(rd, tbest));
+				vec3 n = vscale(vsub(p, sp->center), finv(sp->radius));
+
+				fx ndl = vdot(n, light_dir);
+				if (ndl < 0)
+					ndl = 0;
+
+				fx lit;
+				if (hit == 0) {
+					/* player: mirror, skip shadow ray (tiny
+					 * diffuse term) */
+					lit = AMBIENT + fmul(ndl, FX_ONE - AMBIENT);
+				} else {
+					/* shadow ray vs all other spheres */
+					vec3 sorg = vadd(p, vscale(n, 4096));
+					fx   best2 = 1 << 30;
+					int  blocked = 0;
+					for (int k = 0; k < NUM_SPHERES; k++) {
+						if (k == hit)
+							continue;
+						vec3 oc = vsub(sorg, spheres[k].center);
+						fx b = vdot(oc, light_dir);
+						if (b <= 0)
+							continue;
+						fx c2 = vdot(oc, oc) -
+							fmul(spheres[k].radius,
+							     spheres[k].radius);
+						fx disc = fmul(b, b) - c2;
+						if (disc >= 0) {
+							blocked = 1;
+							break;
+						}
+					}
+					lit = blocked ? AMBIENT
+						     : (AMBIENT + fmul(ndl, FX_ONE - AMBIENT));
+				}
+
+				fx cr = fmul(sp->ar, lit);
+				fx cg = fmul(sp->ag, lit);
+				fx cb = fmul(sp->ab, lit);
+
+				if (sp->reflect > 0) {
+					/* mirror bounce */
+					fx   dn  = vdot(rd, n) * 2;
+					vec3 rfl = vsub(rd, vscale(n, dn));
+					vec3 org = vadd(p, vscale(rfl, 1024));
+					fx   rr = 0, rg = 0, rb = 0;
+					fx   t2;
+					vec3 n2;
+					int  h2 = -1;
+					fx   t2best = TMAX;
+					for (int k = 0; k < NUM_SPHERES; k++) {
+						if (k == hit)
+							continue;
+						vec3 oc = vsub(org, spheres[k].center);
+						fx bb = vdot(oc, rfl);
+						fx cc = vdot(oc, oc) -
+							fmul(spheres[k].radius,
+							     spheres[k].radius);
+						fx disc = fmul(bb, bb) - cc;
+						if (disc < 0)
+							continue;
+						fx sq = fsqrt(disc);
+						fx t = -bb - sq;
+						if (t < 0 || t >= t2best)
+							continue;
+						t2best = t;
+						h2 = k;
+					}
+					if (h2 >= 0) {
+						Sphere *s2 = &spheres[h2];
+						vec3 p2 = vadd(org, vscale(rfl, t2best));
+						vec3 nn = vscale(vsub(p2, s2->center),
+								 finv(s2->radius));
+						fx ndl2 = vdot(nn, light_dir);
+						if (ndl2 < 0)
+							ndl2 = 0;
+						fx l2 = AMBIENT + fmul(ndl2, FX_ONE - AMBIENT);
+						rr = fmul(s2->ar, l2);
+						rg = fmul(s2->ag, l2);
+						rb = fmul(s2->ab, l2);
+					} else if (rfl.y < 0) {
+						fx t3 = fmul(p.y, finv(-rfl.y));
+						vec3 g = vadd(org, vscale(rfl, t3));
+						int checker = ((g.x >> 16) ^ (g.z >> 16)) & 1;
+						rr = fmul(checker ? chk_r : chk_dr, lit_plane);
+						rg = fmul(checker ? chk_g : chk_dg, lit_plane);
+						rb = fmul(checker ? chk_b : chk_db, lit_plane);
+					} else {
+						fx hh = rfl.y;
+						if (hh < 0)
+							hh = 0;
+						rr = SKY_R - (hh >> 1);
+						rg = SKY_G - (hh >> 2);
+						rb = SKY_B;
+						if (rr < 0) rr = 0;
+						if (rg < 0) rg = 0;
+						if (rb > 65535) rb = 65535;
+					}
+
+					fx k = sp->reflect;
+					cr = fmul(cr, FX_ONE - k) + fmul(rr, k);
+					cg = fmul(cg, FX_ONE - k) + fmul(rg, k);
+					cb = fmul(cb, FX_ONE - k) + fmul(rb, k);
+				}
+
+				/* fog */
+				fx fog = fmul(tbest, FOG_INV_RANGE);
+				if (fog > FX_ONE)
+					fog = FX_ONE;
+				fx keep = FX_ONE - fog;
+				cr = fmul(cr, keep) + fmul(SKY_R, fog);
+				cg = fmul(cg, keep) + fmul(SKY_G, fog);
+				cb = fmul(cb, keep) + fmul(SKY_B, fog);
+
+				out = pack555(cr, cg, cb);
+			} else {
+				out = sky_col;
+			}
+
+			fb[py][px] = out;
+			u += ROW_DU;
+			gx += gxs;
+			gz += gzs;
+		}
+
+		v -= ROW_DV;
+		v2 += vstep;
+		vstep += vstep2;
 	}
 }
 
@@ -589,6 +795,7 @@ int main(int argc, const char **argv) {
 	SetDispMask(1);
 
 	light_dir = vnorm(v3(24576, 40960, 16384));
+	rt_init();
 
 	spheres[0].ar = 57344; spheres[0].ag = 58982; spheres[0].ab = 61440;
 	spheres[0].reflect = 57344; /* strong mirror */
