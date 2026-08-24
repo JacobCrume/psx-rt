@@ -1,0 +1,16 @@
+# build artifacts
+emulator/oxpsx
+emulator/*.o
+emulator/src/*.o
+demo/build/
+game/build/
+cputest/build/
+
+# toolchain + downloaded archives (fetch with ./setup-toolchain.sh)
+toolchain/
+third_party/
+
+# dumps
+*.ppm
+*.bin
+dumps/
